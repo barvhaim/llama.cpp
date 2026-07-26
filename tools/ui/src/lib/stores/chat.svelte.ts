@@ -16,6 +16,8 @@ import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
+import { CONTENT_TYPE_HEADER } from '$lib/constants';
+import { MimeTypeApplication } from '$lib/enums';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
 import { config } from '$lib/stores/settings.svelte';
 import { agenticStore } from '$lib/stores/agentic.svelte';
@@ -60,6 +62,7 @@ import {
 	ErrorDialogType,
 	MessageRole,
 	MessageType,
+	ReasoningEffort,
 	StreamConnectionState
 } from '$lib/enums';
 
@@ -207,7 +210,7 @@ class ChatStore {
 			// POST the one conv id we are probing
 			listResp = await fetch(`./v1/streams/lookup`, {
 				method: 'POST',
-				headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+				headers: { ...getAuthHeaders(), [CONTENT_TYPE_HEADER]: MimeTypeApplication.JSON },
 				body: JSON.stringify({ conversation_ids: [convId] })
 			});
 		} catch (e) {
@@ -561,8 +564,14 @@ class ChatStore {
 	 * Abort the current agentic flow signal without clearing loading state.
 	 * Used by "Send immediately" to force the agentic loop to exit so that
 	 * the pending steering message can be re-sent.
+	 *
+	 * Any tool calls captured mid-stream are dropped before the abort so the
+	 * pending message (or a manual follow-up) does not re-send a half-received
+	 * tool call with invalid JSON arguments to the server. Mirrors what the
+	 * Stop button already does through stopGenerationForChat.
 	 */
-	abortCurrentFlow(convId: string): void {
+	async abortCurrentFlow(convId: string): Promise<void> {
+		await this.savePartialResponseIfNeeded(convId);
 		const c = this.abortControllers.get(convId);
 		if (c) {
 			c.abort();
@@ -665,7 +674,7 @@ class ChatStore {
 		try {
 			const resp = await fetch('./v1/streams/lookup', {
 				method: 'POST',
-				headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+				headers: { ...getAuthHeaders(), [CONTENT_TYPE_HEADER]: MimeTypeApplication.JSON },
 				body: JSON.stringify({ conversation_ids: lookupIds })
 			});
 			if (!resp.ok) return;
@@ -1083,6 +1092,11 @@ class ChatStore {
 		let resolvedModel: string | null = null;
 		let modelPersisted = false;
 		const convId = assistantMessage.convId;
+		// Tracks the last message created in this flow. Used as the parent for the next
+		// turn's assistant message so createAssistantMessage does not have to read
+		// conversationsStore.activeMessages, which may belong to a different conversation
+		// after the user navigates while the loop is still running.
+		let lastCreatedInFlow = currentMessageId;
 		// freeze the POST identity from t0 so a stop cancels with the exact session key,
 		// never a stale or empty model resolved later
 		this.setChatStreaming(convId, streamedContent, currentMessageId, effectiveModel);
@@ -1208,8 +1222,15 @@ class ChatStore {
 				};
 				if (timings) uiUpdate.timings = timings;
 				if (resolvedModel) uiUpdate.model = resolvedModel;
-				conversationsStore.updateMessageAtIndex(idx, uiUpdate);
-				await conversationsStore.updateCurrentNode(currentMessageId);
+				// touch the active ui array and node pointer only when this conversation
+				// is displayed; otherwise persist the node move straight to the db so a
+				// foreign conv's currNode stays untouched
+				if (conversationsStore.activeConversation?.id === convId) {
+					conversationsStore.updateMessageAtIndex(idx, uiUpdate);
+					await conversationsStore.updateCurrentNode(currentMessageId);
+				} else {
+					await DatabaseService.updateCurrentNode(convId, currentMessageId);
+				}
 			},
 			createToolResultMessage: async (
 				toolCallId: string,
@@ -1230,17 +1251,45 @@ class ChatStore {
 					},
 					currentMessageId
 				);
-				conversationsStore.addMessageToActive(msg);
-				await conversationsStore.updateCurrentNode(msg.id);
+				// mirror into the active store and move the node pointer only when this
+				// conversation is displayed; otherwise persist the node move straight to
+				// the db for the owning conv so a foreign conv's currNode stays untouched
+				if (conversationsStore.activeConversation?.id === convId) {
+					conversationsStore.addMessageToActive(msg);
+					await conversationsStore.updateCurrentNode(msg.id);
+				} else {
+					await DatabaseService.updateCurrentNode(convId, msg.id);
+				}
+				lastCreatedInFlow = msg.id;
 				return msg;
+			},
+			updateToolResultMessage: async (
+				messageId: string,
+				content: string,
+				extras?: DatabaseMessageExtra[]
+			) => {
+				// Persist latest content + merged extras; mirror into the active
+				// store so the chat view sees live updates for streaming tools
+				// (e.g. exec_shell_command). The existing tool message node
+				// pointer stays put - the renderer is already scoped to it.
+				const updates: Partial<DatabaseMessage> = { content };
+				if (extras) {
+					const idx = conversationsStore.findMessageIndex(messageId);
+					const existing = idx >= 0 ? (conversationsStore.activeMessages[idx]?.extra ?? []) : [];
+					const merged = [...existing, ...extras];
+					updates.extra = merged;
+				}
+				if (conversationsStore.activeConversation?.id === convId) {
+					const idx = conversationsStore.findMessageIndex(messageId);
+					if (idx >= 0) conversationsStore.updateMessageAtIndex(idx, updates);
+				}
+				await DatabaseService.updateMessage(messageId, updates);
 			},
 			createAssistantMessage: async () => {
 				// Reset streaming state for new message
 				streamedContent = '';
 				streamedReasoningContent = '';
 
-				const lastMsg =
-					conversationsStore.activeMessages[conversationsStore.activeMessages.length - 1];
 				const msg = await DatabaseService.createMessageBranch(
 					{
 						convId,
@@ -1252,10 +1301,13 @@ class ChatStore {
 						children: [],
 						model: resolvedModel
 					},
-					lastMsg.id
+					lastCreatedInFlow
 				);
-				conversationsStore.addMessageToActive(msg);
+				if (conversationsStore.activeConversation?.id === convId) {
+					conversationsStore.addMessageToActive(msg);
+				}
 				currentMessageId = msg.id;
+				lastCreatedInFlow = msg.id;
 				return msg;
 			},
 			onFlowComplete: (finalTimings?: ChatMessageTimings) => {
@@ -1312,7 +1364,7 @@ class ChatStore {
 			}
 		};
 
-		const perChatOverrides = conversationsStore.activeConversation?.mcpServerOverrides;
+		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -1483,21 +1535,27 @@ class ChatStore {
 
 		const partialContent = streamingState.response;
 		const partialReasoning = lastMessage.reasoningContent || '';
+		// snapshot the streamed tool calls before clearing so we still know whether
+		// anything was captured when deciding to skip the DB write below
+		const hadPartialToolCalls = !!lastMessage.toolCalls?.trim();
 
-		// nothing to persist when both content and reasoning are empty (e.g. stop before any token)
-		if (!partialContent.trim() && !partialReasoning.trim()) return;
+		// nothing to persist when content, reasoning, and streamed tool calls are all empty
+		// (e.g. stop before any token). otherwise drop the partial tool call and write whatever
+		// was streamed: incomplete arguments (truncated JSON, missing closing quote) would
+		// otherwise be re-sent to the server on the next turn and rejected.
+		if (!partialContent.trim() && !partialReasoning.trim() && !hadPartialToolCalls) return;
 
 		try {
 			const updateData: {
-				content: string;
+				content?: string;
 				reasoningContent?: string;
+				toolCalls?: string;
 				timings?: ChatMessageTimings;
 			} = {
-				content: partialContent
+				toolCalls: ''
 			};
-			if (partialReasoning) {
-				updateData.reasoningContent = partialReasoning;
-			}
+			if (partialContent.trim()) updateData.content = partialContent;
+			if (partialReasoning.trim()) updateData.reasoningContent = partialReasoning;
 			const lastKnownState = this.getProcessingState(conversationId);
 			if (lastKnownState) {
 				updateData.timings = {
@@ -1513,9 +1571,14 @@ class ChatStore {
 			}
 			await DatabaseService.updateMessage(lastMessage.id, updateData);
 			lastMessage.content = partialContent;
+			// mirror the drop into the in-memory message so the next request sent via
+			// sendMessage (queued pending, Send immediately, or manual follow-up) reads
+			// the cleared value, not whatever the streaming widget had been showing
+			lastMessage.toolCalls = '';
 			if (updateData.timings) lastMessage.timings = updateData.timings;
 		} catch (error) {
 			lastMessage.content = partialContent;
+			lastMessage.toolCalls = '';
 			console.error('Failed to save partial response:', error);
 		}
 	}
@@ -1535,7 +1598,7 @@ class ChatStore {
 			conversationsStore.updateMessageAtIndex(messageIndex, { content: newContent });
 			await DatabaseService.updateMessage(messageId, { content: newContent });
 			if (isFirstUserMessage && newContent.trim())
-				await conversationsStore.updateConversationTitleWithConfirmation(
+				await conversationsStore.updateConversationName(
 					activeConv.id,
 					generateConversationTitle(newContent, Boolean(config().titleGenerationUseFirstLine))
 				);
@@ -2052,7 +2115,7 @@ class ChatStore {
 			const rootMessage = allMessages.find((m) => m.type === 'root' && m.parent === null);
 
 			if (rootMessage && msg.parent === rootMessage.id && newContent.trim()) {
-				await conversationsStore.updateConversationTitleWithConfirmation(
+				await conversationsStore.updateConversationName(
 					activeConv.id,
 					generateConversationTitle(newContent, Boolean(config().titleGenerationUseFirstLine))
 				);
@@ -2126,7 +2189,7 @@ class ChatStore {
 
 			conversationsStore.updateConversationTimestamp();
 			if (isFirstUserMessage && newContent.trim())
-				await conversationsStore.updateConversationTitleWithConfirmation(
+				await conversationsStore.updateConversationName(
 					activeConv.id,
 					generateConversationTitle(newContent, Boolean(config().titleGenerationUseFirstLine))
 				);
@@ -2312,8 +2375,12 @@ class ChatStore {
 
 		if (currentConfig.excludeReasoningFromContext) apiOptions.excludeReasoningFromContext = true;
 
-		apiOptions.enableThinking = conversationsStore.getThinkingEnabled();
-		apiOptions.reasoningEffort = conversationsStore.getReasoningEffort();
+		// an explicit reasoning choice overrides the server default, DEFAULT sends nothing
+		const effort = conversationsStore.getReasoningEffort();
+		if (effort !== ReasoningEffort.DEFAULT) {
+			apiOptions.enableThinking = effort !== ReasoningEffort.OFF;
+			if (effort !== ReasoningEffort.OFF) apiOptions.reasoningEffort = effort;
+		}
 
 		if (hasValue(currentConfig.temperature))
 			apiOptions.temperature = Number(currentConfig.temperature);
@@ -2366,7 +2433,8 @@ class ChatStore {
 
 		if (currentConfig.samplers) apiOptions.samplers = currentConfig.samplers;
 
-		apiOptions.backend_sampling = currentConfig.backend_sampling;
+		if (hasValue(currentConfig.backend_sampling))
+			apiOptions.backend_sampling = currentConfig.backend_sampling;
 
 		if (currentConfig.customJson) apiOptions.custom = currentConfig.customJson;
 
